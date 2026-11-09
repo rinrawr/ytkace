@@ -1556,7 +1556,11 @@ static NSDictionary *YTKACEPlayerDefinition(void) {
                                @"YTKACE.Preference.Player.HoldSpeedEnabled"),
             YTKACEStackedSlider(@"Hold speed",
                                 @"YTKACE.Preference.Player.HoldSpeedRate",
-                                0.25, 5.0, 0.25, 2.0, @"speed")
+                                0.25, 5.0, 0.25, 2.0, @"speed"),
+            YTKACEToggleDetail(@"Swipe Down to Lock Speed",
+                               @"While holding to speed up, swipe down and let go to keep that speed. "
+                               @"Do it again to unlock.",
+                               @"YTKACE.Preference.Player.HoldSpeedLock")
         ],
         @[
             YTKACEToggleDetail(@"Background Audio",
@@ -2061,6 +2065,9 @@ static NSDictionary *YTKACEGestureOptionsDefinition(void) {
             YTKACEStepper(@"Seconds", @"YTKACE.Preference.Playback.DoubleTapSeconds", 5.0, 60.0, 5.0, 10.0)
         ],
         @[
+            YTKACEToggleDetail(@"Swipe to Seek",
+                               @"Swipe left or right across the video to scrub through it.",
+                               @"YTKACE.Preference.Gestures.SwipeToSeek"),
             YTKACEToggleDetail(@"Hold to Seek", @"Hold the left or right side to rewind or fast-forward.",
                                @"YTKACE.Preference.Gestures.HoldToSeek"),
             YTKACESlider(@"Seek Step", @"YTKACE.Preference.Gestures.HoldSeekSeconds", 1.0, 60.0, 1.0, 10.0),

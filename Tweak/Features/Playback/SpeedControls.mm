@@ -1,7 +1,9 @@
 #import "../../YTKACE.h"
 #import "../../Runtime/Hooking.h"
+#import "../../Runtime/Localization.h"
 #import "../../Runtime/Preferences.h"
 #import "../../UI/Assets.h"
+#import "../../UI/Notice.h"
 #import "../../UI/OverlayButtonHost.h"
 
 #import <AVFoundation/AVFoundation.h>
@@ -162,6 +164,28 @@ static NSString *YTKACESpeedText(double rate) {
     return [NSString stringWithFormat:@"%.2fx", rate];
 }
 
+// Hold-to-speed lock, ported from YouMod: while holding for speed, drag down
+// to arm the lock and release to keep that speed. Doing it again unlocks.
+static NSString *const YTKACEHoldLockKey =
+    @"YTKACE.Preference.Player.HoldSpeedLock";
+static NSString *const YTKACESpeedLockedKey =
+    @"YTKACE.Preference.Player.SpeedLocked";
+static NSString *const YTKACESpeedLockedRateKey =
+    @"YTKACE.Preference.Player.SpeedLockedRate";
+static NSString *const YTKACESpeedUnlockedRateKey =
+    @"YTKACE.Preference.Player.SpeedUnlockedRate";
+
+static BOOL YTKACESpeedLockActive(void) {
+    return YTKACEFeatureEnabled(YTKACEHoldLockKey) &&
+        [NSUserDefaults.standardUserDefaults boolForKey:YTKACESpeedLockedKey];
+}
+
+static double YTKACESpeedLockedRate(void) {
+    const double rate = [NSUserDefaults.standardUserDefaults
+        doubleForKey:YTKACESpeedLockedRateKey];
+    return YTKACERateIsUsable(rate) ? rate : 2.0;
+}
+
 static UIImage *YTKACESpeedButtonImage(BOOL plus) {
     CGSize size = CGSizeMake(22.0, 22.0);
     UIGraphicsBeginImageContextWithOptions(size, NO, 0.0);
@@ -290,8 +314,10 @@ static UIImage *YTKACESpeedButtonImage(BOOL plus) {
     if ([self.primedVideo isEqualToString:identifier]) return NO;
     self.primedVideo = identifier;
 
-    const double target = YTKACESourceUsesShortsRate(source)
-        ? YTKACEShortsRate() : YTKACEStartPlaybackRate();
+    const BOOL shorts = YTKACESourceUsesShortsRate(source);
+    const double target = shorts ? YTKACEShortsRate()
+        : YTKACESpeedLockActive() ? YTKACESpeedLockedRate()
+        : YTKACEStartPlaybackRate();
     if (!YTKACERateIsUsable(target)) return NO;
     const double playing = [self rateFromObject:source depth:0];
     if (fabs(playing - target) < 0.01) return NO;
@@ -613,21 +639,227 @@ static void YTKACESpeedmasterActivated(id receiver, SEL selector, BOOL active) {
     YTKACEApplyHoldRate(@"activated");
 }
 
+static BOOL YTKACEHoldTouchActive;
+static BOOL YTKACEHoldInitiallyLocked;
+static BOOL YTKACEHoldLockPending;
+static CGPoint YTKACEHoldStartPoint;
+static const void *YTKACESpeedToastAssociation = &YTKACESpeedToastAssociation;
+
+BOOL YTKACESpeedmasterHoldActive(void) {
+    return YTKACEHoldTouchActive;
+}
+
+static double YTKACEHoldTargetRate(void) {
+    if (YTKACEFeatureEnabled(YTKACEHoldSpeedKey)) {
+        const double stored =
+            [YTKACEPreferenceObject(YTKACEHoldSpeedRateKey) doubleValue];
+        if (YTKACERateIsUsable(stored)) return stored;
+    }
+    return 2.0;
+}
+
+static double YTKACESpeedUnlockedRate(void) {
+    const double rate = [NSUserDefaults.standardUserDefaults
+        doubleForKey:YTKACESpeedUnlockedRateKey];
+    return YTKACERateIsUsable(rate) ? rate : 1.0;
+}
+
+static UILabel *YTKACESpeedToastLabel(UIView *host) {
+    UILabel *label = objc_getAssociatedObject(host, YTKACESpeedToastAssociation);
+    if (label != nil) return label;
+    UIView *toast = [UIView new];
+    toast.userInteractionEnabled = NO;
+    toast.clipsToBounds = YES;
+    toast.alpha = 0.0;
+    toast.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.9];
+    YTKACEApplyGlassBackground(toast, YES);
+    label = [UILabel new];
+    label.textColor = UIColor.whiteColor;
+    label.textAlignment = NSTextAlignmentCenter;
+    label.numberOfLines = 2;
+    label.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    [toast addSubview:label];
+    [host addSubview:toast];
+    objc_setAssociatedObject(host, YTKACESpeedToastAssociation, label,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return label;
+}
+
+static NSAttributedString *YTKACESpeedToastText(double rate, BOOL locked) {
+    UIColor *color = UIColor.whiteColor;
+    NSMutableAttributedString *text = [NSMutableAttributedString new];
+    NSTextAttachment *hare = [NSTextAttachment new];
+    hare.image = [[UIImage systemImageNamed:@"hare.fill"] imageWithTintColor:color];
+    hare.bounds = CGRectMake(0.0, -2.0, 14.0, 14.0);
+    if (hare.image != nil) {
+        [text appendAttributedString:
+            [NSAttributedString attributedStringWithAttachment:hare]];
+    }
+    [text appendAttributedString:[[NSAttributedString alloc]
+        initWithString:[NSString stringWithFormat:@" %@\n",
+                        YTKACELocalized(@"Playback Speed")]]];
+    NSTextAttachment *lock = [NSTextAttachment new];
+    lock.image = [[UIImage systemImageNamed:locked ? @"lock.fill" : @"lock.open.fill"]
+        imageWithTintColor:color];
+    lock.bounds = CGRectMake(0.0, -1.0, 12.0, 12.0);
+    if (lock.image != nil) {
+        [text appendAttributedString:
+            [NSAttributedString attributedStringWithAttachment:lock]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@" "]];
+    }
+    [text appendAttributedString:[[NSAttributedString alloc]
+        initWithString:YTKACESpeedText(rate)]];
+    NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
+    paragraph.alignment = NSTextAlignmentCenter;
+    paragraph.lineSpacing = 3.0;
+    [text addAttributes:@{NSParagraphStyleAttributeName: paragraph,
+                          NSForegroundColorAttributeName: color}
+                  range:NSMakeRange(0, text.length)];
+    return text;
+}
+
+static void YTKACEShowSpeedToast(UIView *host, double rate, BOOL locked) {
+    if (host == nil) return;
+    UILabel *label = YTKACESpeedToastLabel(host);
+    UIView *toast = label.superview;
+    label.attributedText = YTKACESpeedToastText(rate, locked);
+    CGSize text = [label.attributedText
+        boundingRectWithSize:CGSizeMake(CGRectGetWidth(host.bounds) * 0.8, CGFLOAT_MAX)
+                     options:NSStringDrawingUsesLineFragmentOrigin |
+                             NSStringDrawingUsesFontLeading
+                     context:nil].size;
+    const CGFloat height = ceil(text.height) + 16.0;
+    const CGFloat width = MAX(ceil(text.width) + height + 24.0, height * 2.2);
+    toast.bounds = CGRectMake(0.0, 0.0, width, height);
+    toast.layer.cornerRadius = height * 0.5;
+    label.frame = toast.bounds;
+    // Sit below YouTube's own speed pill, which stays visible while holding.
+    toast.center = CGPointMake(CGRectGetMidX(host.bounds),
+                               host.safeAreaInsets.top + 88.0);
+    toast.layer.zPosition = 999.0;
+    [host bringSubviewToFront:toast];
+    [UIView animateWithDuration:0.2 animations:^{ toast.alpha = 1.0; }];
+}
+
+static void YTKACEHideSpeedToast(UIView *host) {
+    UIView *toast = [objc_getAssociatedObject(host, YTKACESpeedToastAssociation) superview];
+    [UIView animateWithDuration:0.2 animations:^{ toast.alpha = 0.0; }];
+}
+
+// YouTube puts its own rate back when the hold ends, sometimes a beat later,
+// so apply ours after it and once more in case it lands late.
+static void YTKACESetRateAfterSpeedmaster(double rate) {
+    for (NSNumber *delay in @[@0.05, @0.35]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (YTKACEHoldTouchActive) return;
+            [[YTKACESpeedCoordinator sharedCoordinator] setRate:rate];
+        });
+    }
+}
+
+static void YTKACEHoldLockBegan(UILongPressGestureRecognizer *recognizer) {
+    YTKACEHoldTouchActive = YES;
+    YTKACEHoldLockPending = NO;
+    YTKACEHoldInitiallyLocked = YTKACESpeedLockActive();
+    YTKACEHoldStartPoint = [recognizer locationInView:recognizer.view];
+    if (!YTKACEHoldInitiallyLocked) {
+        const double base = [YTKACESpeedCoordinator sharedCoordinator].currentRate;
+        if (fabs(base - YTKACEHoldTargetRate()) > 0.01) {
+            [NSUserDefaults.standardUserDefaults
+                setDouble:(YTKACERateIsUsable(base) ? base : 1.0)
+                   forKey:YTKACESpeedUnlockedRateKey];
+        }
+    }
+}
+
+static void YTKACEHoldLockChanged(UILongPressGestureRecognizer *recognizer) {
+    if (!YTKACEFeatureEnabled(YTKACEHoldLockKey)) return;
+    const CGFloat drag = [recognizer locationInView:recognizer.view].y -
+        YTKACEHoldStartPoint.y;
+    BOOL changed = NO;
+    if (!YTKACEHoldLockPending && drag > 40.0) {
+        YTKACEHoldLockPending = YES;
+        changed = YES;
+    } else if (YTKACEHoldLockPending && drag < 20.0) {
+        YTKACEHoldLockPending = NO;
+        changed = YES;
+    }
+    if (!changed) return;
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc]
+        initWithStyle:YTKACEHoldLockPending ? UIImpactFeedbackStyleMedium
+                                            : UIImpactFeedbackStyleLight];
+    [feedback impactOccurred];
+    const BOOL preview = YTKACEHoldInitiallyLocked != YTKACEHoldLockPending;
+    const double rate = preview || !YTKACEHoldInitiallyLocked
+        ? YTKACEHoldTargetRate() : YTKACESpeedUnlockedRate();
+    YTKACEShowSpeedToast(recognizer.view, rate, preview);
+}
+
 static void YTKACESpeedmasterLongPress(id receiver, SEL selector,
                                        UILongPressGestureRecognizer *recognizer) {
-    if (recognizer.state == UIGestureRecognizerStateBegan) YTKACEHoldPillActive = YES;
+    const UIGestureRecognizerState state = recognizer.state;
+    const BOOL ending = state == UIGestureRecognizerStateEnded ||
+        state == UIGestureRecognizerStateCancelled ||
+        state == UIGestureRecognizerStateFailed;
+    if (state == UIGestureRecognizerStateBegan) {
+        YTKACEHoldPillActive = YES;
+        YTKACEHoldLockBegan(recognizer);
+    }
+
+    BOOL wasLocked = NO;
+    BOOL locked = NO;
+    if (ending) {
+        wasLocked = YTKACEHoldInitiallyLocked;
+        locked = wasLocked;
+        if (YTKACEFeatureEnabled(YTKACEHoldLockKey) && YTKACEHoldLockPending &&
+            state != UIGestureRecognizerStateFailed) {
+            locked = !wasLocked;
+        }
+        YTKACEHoldTouchActive = NO;
+        YTKACEHoldLockPending = NO;
+        YTKACEHoldPillActive = NO;
+        if (locked || wasLocked) {
+            // We decide the rate ourselves below; keep the custom hold
+            // speed restore from racing it.
+            YTKACEHoldOverrideActive = NO;
+        }
+    }
+
     if (OriginalSpeedmasterLongPress != NULL) {
         ((void (*)(id, SEL, id))OriginalSpeedmasterLongPress)(receiver, selector,
                                                               recognizer);
     }
-    if (recognizer.state == UIGestureRecognizerStateBegan) {
+
+    if (state == UIGestureRecognizerStateBegan) {
         YTKACEApplyHoldRate(@"longpress");
+        if (YTKACEFeatureEnabled(YTKACEHoldLockKey)) {
+            YTKACEShowSpeedToast(recognizer.view, YTKACEHoldTargetRate(),
+                                 YTKACEHoldInitiallyLocked);
+        }
         return;
     }
-    if (recognizer.state == UIGestureRecognizerStateEnded ||
-        recognizer.state == UIGestureRecognizerStateCancelled ||
-        recognizer.state == UIGestureRecognizerStateFailed) {
-        YTKACEHoldPillActive = NO;
+    if (state == UIGestureRecognizerStateChanged) {
+        YTKACEHoldLockChanged(recognizer);
+        return;
+    }
+    if (!ending) return;
+
+    YTKACEHideSpeedToast(recognizer.view);
+    if (locked != wasLocked) {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        [defaults setBool:locked forKey:YTKACESpeedLockedKey];
+        if (locked) {
+            [defaults setDouble:YTKACEHoldTargetRate()
+                         forKey:YTKACESpeedLockedRateKey];
+        }
+    }
+    if (locked) {
+        YTKACESetRateAfterSpeedmaster(YTKACESpeedLockedRate());
+    } else if (wasLocked) {
+        YTKACESetRateAfterSpeedmaster(YTKACESpeedUnlockedRate());
+    } else {
         YTKACERestoreHoldRate();
     }
 }

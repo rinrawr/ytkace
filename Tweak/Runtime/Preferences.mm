@@ -104,6 +104,8 @@ void YTKACERegisterDefaults(void) {
         @"YTKACE.Preference.Overlay.FullscreenActionsHidden": @NO,
         @"YTKACE.Preference.Player.HoldSpeedEnabled": @NO,
         @"YTKACE.Preference.Player.HoldSpeedRate": @2.0,
+        @"YTKACE.Preference.Player.HoldSpeedLock": @YES,
+        @"YTKACE.Preference.Gestures.SwipeToSeek": @YES,
         @"YTKACE.Preference.Gestures.LandscapeOnly": @NO,
         @"YTKACE.Preference.Profiles.Preview": @YES,
         @"YTKACE.Preference.Posts.SaveImage": @YES,

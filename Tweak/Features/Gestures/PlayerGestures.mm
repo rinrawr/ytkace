@@ -51,6 +51,75 @@ static UIScreen *YTKACEScreenForView(UIView *view) {
 
 @end
 
+static const NSInteger YTKACEGestureActionSeek = 4;
+
+static id YTKACEGestureValue(id object, NSString *key) {
+    if (object == nil) return nil;
+    @try {
+        return [object valueForKey:key];
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+// Swipe to seek, ported from YouMod (originally @bhackel, YTLitePlus): the pan
+// is handed to YouTube's own player bar controller, so it scrubs with the
+// native thumbnail preview and timestamp.
+static id YTKACEPlayerBarControllerForOverlay(UIView *overlay) {
+    id controller = YTKACEGestureValue(
+        YTKACEGestureValue(overlay, @"playerBar"), @"_delegate");
+    return [controller respondsToSelector:NSSelectorFromString(@"didScrub:")]
+        ? controller : nil;
+}
+
+static BOOL YTKACEOverlayVideoZoomed(UIView *overlay) {
+    id controller = YTKACEGestureValue(
+        YTKACEGestureValue(overlay, @"videoFreeZoomOverlayView"), @"_delegate");
+    if (![controller respondsToSelector:@selector(state)]) return NO;
+    return ((NSInteger (*)(id, SEL))objc_msgSend)(controller, @selector(state)) == 4;
+}
+
+static BOOL YTKACEOverlayRelatedVideosExpanded(UIView *overlay) {
+    id controller = YTKACEGestureValue(YTKACEGestureValue(YTKACEGestureValue(
+        overlay, @"_fullscreenEngagementOverlayView"), @"_relatedVideosView"),
+        @"_delegate");
+    SEL expanded = NSSelectorFromString(@"isExpanded");
+    return [controller respondsToSelector:expanded] &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(controller, expanded);
+}
+
+// Drags that start on the progress bar belong to the bar's own scrubber.
+static BOOL YTKACEPointNearPlayerBar(UIView *overlay, CGPoint point) {
+    UIView *bar = YTKACEGestureValue(overlay, @"playerBar");
+    if (![bar isKindOfClass:UIView.class] || bar.hidden || bar.alpha < 0.01 ||
+        bar.window == nil) {
+        return NO;
+    }
+    CGRect frame = [bar convertRect:bar.bounds toView:overlay];
+    return CGRectContainsPoint(CGRectInset(frame, 0.0, -24.0), point);
+}
+
+// Width of the video area not covered by a side engagement panel (comments,
+// description) in fullscreen.
+static CGFloat YTKACEOverlayUncoveredWidth(UIView *overlay) {
+    const CGFloat full = CGRectGetWidth(overlay.bounds);
+    UIView *container = YTKACEGestureValue(overlay, @"_engagementPanelContainerView");
+    SEL stateSelector = NSSelectorFromString(@"engagementPanelState");
+    if (![container isKindOfClass:UIView.class] ||
+        ![container respondsToSelector:stateSelector] ||
+        ((NSInteger (*)(id, SEL))objc_msgSend)(container, stateSelector) != 3) {
+        return full;
+    }
+    Class layoutContainer = NSClassFromString(@"UILayoutContainerView");
+    for (UIView *subview in container.subviews) {
+        if (layoutContainer == Nil || ![subview isKindOfClass:layoutContainer]) continue;
+        const CGFloat panel = CGRectGetWidth(subview.bounds);
+        if (panel > 0.0 && panel < full) return full - panel;
+        break;
+    }
+    return full;
+}
+
 @interface YTKACEGestureCoordinator : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)sharedCoordinator;
 @property(nonatomic, strong) NSTimer *seekTimer;
@@ -59,6 +128,7 @@ static UIScreen *YTKACEScreenForView(UIView *view) {
 @property(nonatomic, assign) double seekTime;
 @property(nonatomic, assign) NSInteger seekDirection;
 - (void)handleEdgePan:(UIPanGestureRecognizer *)recognizer;
+- (void)handleSwipeSeek:(UIPanGestureRecognizer *)recognizer;
 - (void)handleHold:(UILongPressGestureRecognizer *)recognizer;
 - (void)handleTwoFingerTap:(UITapGestureRecognizer *)recognizer;
 @end
@@ -258,7 +328,24 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
         if (surface != 1) return NO;
         CGRect activeBounds = view.bounds;
         if (CGRectIsEmpty(activeBounds) || CGRectIsNull(activeBounds)) return NO;
-        if (fabs(velocity.y) <= fabs(velocity.x)) return NO;
+        // Leave the finger alone while it is holding for speed or seeking, so
+        // the hold's swipe-down speed lock doesn't also move brightness/volume.
+        if (YTKACESpeedmasterHoldActive() || self.seekTimer != nil) return NO;
+        if (fabs(velocity.x) > fabs(velocity.y)) {
+            if (!YTKACEFeatureEnabled(@"YTKACE.Preference.Gestures.SwipeToSeek") ||
+                location.x > YTKACEOverlayUncoveredWidth(view) ||
+                YTKACEPointNearPlayerBar(view, location) ||
+                YTKACEOverlayVideoZoomed(view) ||
+                YTKACEOverlayRelatedVideosExpanded(view) ||
+                YTKACEPlayerBarControllerForOverlay(view) == nil) {
+                return NO;
+            }
+            objc_setAssociatedObject(gestureRecognizer,
+                                     YTKACEGestureActionAssociation,
+                                     @(YTKACEGestureActionSeek),
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return YES;
+        }
         double storedArea = [YTKACEPreferenceObject(
             @"YTKACE.Preference.Gestures.ActivationArea") doubleValue];
         double areaPercent = storedArea > 0.0 ? storedArea : 20.0;
@@ -361,10 +448,28 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     [view bringSubviewToFront:indicator];
 }
 
+- (void)handleSwipeSeek:(UIPanGestureRecognizer *)recognizer {
+    id controller = YTKACEPlayerBarControllerForOverlay(recognizer.view);
+    if (controller != nil) {
+        ((void (*)(id, SEL, id))objc_msgSend)(
+            controller, NSSelectorFromString(@"didScrub:"), recognizer);
+    }
+    if (recognizer.state == UIGestureRecognizerStateEnded ||
+        recognizer.state == UIGestureRecognizerStateCancelled ||
+        recognizer.state == UIGestureRecognizerStateFailed) {
+        objc_setAssociatedObject(recognizer, YTKACEGestureActionAssociation,
+                                 nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 - (void)handleEdgePan:(UIPanGestureRecognizer *)recognizer {
     UIView *view = recognizer.view;
     NSInteger action = [objc_getAssociatedObject(
         recognizer, YTKACEGestureActionAssociation) integerValue];
+    if (action == YTKACEGestureActionSeek) {
+        [self handleSwipeSeek:recognizer];
+        return;
+    }
     BOOL volume = action == 2;
     BOOL both = action == 3;
     if (recognizer.state == UIGestureRecognizerStateBegan) {
