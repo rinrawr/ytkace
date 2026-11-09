@@ -733,9 +733,12 @@ static void YTKACEShowSpeedToast(UIView *host, double rate, BOOL locked) {
     toast.bounds = CGRectMake(0.0, 0.0, width, height);
     toast.layer.cornerRadius = height * 0.5;
     label.frame = toast.bounds;
-    // Sit below YouTube's own speed pill, which stays visible while holding.
+    // YouTube shows its own speed pill only when the hold changes the speed,
+    // i.e. when we weren't already locked. Sit below it then; otherwise take
+    // its place at the top.
+    const CGFloat offset = YTKACEHoldInitiallyLocked ? 36.0 : 88.0;
     toast.center = CGPointMake(CGRectGetMidX(host.bounds),
-                               host.safeAreaInsets.top + 88.0);
+                               host.safeAreaInsets.top + offset);
     toast.layer.zPosition = 999.0;
     [host bringSubviewToFront:toast];
     [UIView animateWithDuration:0.2 animations:^{ toast.alpha = 1.0; }];
@@ -834,9 +837,10 @@ static void YTKACESpeedmasterLongPress(id receiver, SEL selector,
 
     if (state == UIGestureRecognizerStateBegan) {
         YTKACEApplyHoldRate(@"longpress");
-        if (YTKACEFeatureEnabled(YTKACEHoldLockKey)) {
-            YTKACEShowSpeedToast(recognizer.view, YTKACEHoldTargetRate(),
-                                 YTKACEHoldInitiallyLocked);
+        // When unlocked, YouTube's own pill already shows the hold speed; ours
+        // appears only once the drag arms the lock.
+        if (YTKACEHoldInitiallyLocked) {
+            YTKACEShowSpeedToast(recognizer.view, YTKACESpeedLockedRate(), YES);
         }
         return;
     }
